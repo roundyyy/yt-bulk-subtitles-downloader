@@ -24,7 +24,7 @@ A high-performance CLI tool for mass downloading subtitles (captions) from YouTu
 
 ### Option 2: Windows Executable
 
-Download the pre-compiled executable from the [Releases](https://github.com/YOUR_USERNAME/YOUR_REPO/releases) page.
+Download the pre-compiled executable from the [Releases](https://github.com/roundyyy/yt-bulk-subtitles-downloader/releases/download/0.1/yt-bsd.exe) page.
 
 ## Requirements
 
@@ -64,3 +64,4 @@ This tool is intended for educational purposes only.
 ## License
 
 MIT License
+
