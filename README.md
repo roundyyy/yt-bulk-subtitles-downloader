@@ -59,9 +59,9 @@ This tool is intended for educational purposes only.
 
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) - Video metadata extraction
 - [youtube-transcript-api](https://github.com/jdepoix/youtube-transcript-api) - Transcript fetching
-- [free-proxy-list.net](https://free-proxy-list.net/en/) - Free proxy list
 
 ## License
 
 MIT License
+
 
