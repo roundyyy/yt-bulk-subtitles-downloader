@@ -74,8 +74,11 @@ class NoTranscriptError(Exception):
 # Configuration - Paths (needed before functions that use them)
 # ============================================================================
 
-# Paths
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Paths - detect if running as PyInstaller exe
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = os.path.dirname(sys.executable)
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROGRESS_DIR = os.path.join(SCRIPT_DIR, "subtitles")
 PROGRESS_FILE = os.path.join(SCRIPT_DIR, ".progress.json")
 PROXY_FILE = os.path.join(SCRIPT_DIR, "proxies.txt")
