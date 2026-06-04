@@ -38,7 +38,7 @@ No Python installation required. Place the exe in any folder on your PC and run 
 2. Select download mode:
    - Single video
    - Playlist
-   - Channel (videos, shorts, or both)
+   - Channel (videos, shorts, live streams, or combinations)
 3. Enter the YouTube URL
 4. Configure thread count and output format
 5. Wait for download to complete
