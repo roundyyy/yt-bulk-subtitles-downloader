@@ -715,10 +715,22 @@ def get_video_ids_from_url(url: str, mode: str, proxy_pool: ProxyPool = None) ->
 # Transcript Fetching
 # ============================================================================
 
+# Preferred transcript languages, set by the wizard (get_language_preference).
+# Order matters: the first match wins. Last entry 'any' means "fall back to
+# whatever transcript exists". Defaults to the old English-first behavior.
+TRANSCRIPT_LANGUAGES = ['en', 'any']
+
+
+def set_transcript_languages(languages: list):
+    global TRANSCRIPT_LANGUAGES
+    TRANSCRIPT_LANGUAGES = list(languages) or ['en', 'any']
+
+
 def check_transcript_availability(video_id: str, proxy: str = None) -> tuple:
     """
     Check what transcripts are available for a video.
     Returns (transcript_obj, language_info) or raises NoTranscriptError.
+    Uses TRANSCRIPT_LANGUAGES (set by the wizard) as the preference order.
     """
     if proxy:
         proxy_url = f"http://{proxy}"
@@ -730,31 +742,37 @@ def check_transcript_availability(video_id: str, proxy: str = None) -> tuple:
     try:
         transcript_list = ytt_api.list(video_id)
 
-        # Try English first
+        lang_codes = [c for c in TRANSCRIPT_LANGUAGES if c and c != 'any']
+        allow_any = 'any' in TRANSCRIPT_LANGUAGES or not lang_codes
+
+        # Try each preferred language in order (manual transcripts first)
         try:
-            transcript = transcript_list.find_transcript(["en"])
+            transcript = transcript_list.find_transcript(lang_codes)
             lang_type = "auto-generated" if transcript.is_generated else "manual"
-            return (transcript, f"English ({lang_type})")
+            return (transcript, f"{transcript.language} ({lang_type})")
         except NoTranscriptFound:
             pass
 
-        # Try translatable transcript
-        for available_transcript in transcript_list:
-            if available_transcript.is_translatable:
-                translation_codes = [
-                    lang.get('language_code', '')
-                    for lang in available_transcript.translation_languages
-                ]
-                if 'en' in translation_codes:
-                    translated = available_transcript.translate('en')
-                    return (translated, f"Translated from {available_transcript.language}")
+        # Try translatable transcripts translated into the first preferred language
+        if lang_codes:
+            target = lang_codes[0]
+            for available_transcript in transcript_list:
+                if available_transcript.is_translatable:
+                    translation_codes = [
+                        lang.get('language_code', '')
+                        for lang in available_transcript.translation_languages
+                    ]
+                    if target in translation_codes:
+                        translated = available_transcript.translate(target)
+                        return (translated, f"Translated from {available_transcript.language} to {target}")
 
-        # Fall back to any available
-        available = list(transcript_list)
-        if available:
-            return (available[0], f"{available[0].language} (no English available)")
+        # Fall back to any available transcript
+        if allow_any:
+            available = list(transcript_list)
+            if available:
+                return (available[0], f"{available[0].language} (no preferred language available)")
 
-        raise NoTranscriptError("No transcript available in any language")
+        raise NoTranscriptError("No transcript available in the selected languages")
 
     except TranscriptsDisabled:
         raise NoTranscriptError("Transcripts are disabled for this video")
@@ -1472,7 +1490,8 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
         'completed': not was_interrupted,
         'mode': 'parallel_collaborative',
         'proxy_refreshes': work_queue.proxy_refresh_count,
-        'output_config': output_config
+        'output_config': output_config,
+        'transcript_languages': list(TRANSCRIPT_LANGUAGES)
     }
     save_progress(progress_data)
 
@@ -1618,6 +1637,53 @@ def get_channel_content_type() -> str:
             print("Invalid choice. Please enter 1, 2, or 3.")
         except ValueError:
             print("Invalid input. Please enter a number.")
+
+
+def get_language_preference() -> list:
+    """Ask user for preferred transcript language(s). Returns language code list."""
+    print("\nTranscript language:\n")
+    print("  [1] Italian (it)")
+    print("  [2] English (en)")
+    print("  [3] Custom language code (e.g., es, fr, de, ja...)")
+    print("  [4] Any language (whatever is available)\n")
+
+    while True:
+        try:
+            choice = int(input("Enter your choice (1-4): "))
+            if choice == 1:
+                langs = ['it']
+                break
+            elif choice == 2:
+                langs = ['en']
+                break
+            elif choice == 3:
+                code = input("Language code(s), comma-separated (e.g., 'es' or 'it,en'): ").strip().lower()
+                langs = [c.strip() for c in code.split(',') if c.strip()]
+                if langs:
+                    break
+                print("Please enter at least one language code.")
+            elif choice == 4:
+                langs = ['any']
+                break
+            print("Invalid choice. Please enter 1-4.")
+        except ValueError:
+            print("Invalid input. Please enter a number.")
+
+    # Ask whether to fall back to any available language when none of the
+    # preferred ones exists (default: yes, so downloads don't get skipped)
+    while True:
+        fallback = input("Fall back to any available language if none of the preferred ones exists? (Y/n): ").strip().lower()
+        if fallback in ('', 'y', 'yes'):
+            if 'any' not in langs:
+                langs.append('any')
+            break
+        elif fallback in ('n', 'no'):
+            break
+        print("Please answer Y or n.")
+
+    set_transcript_languages(langs)
+    print(f"Preferred transcript language(s): {', '.join(langs)}")
+    return langs
 
 
 def get_output_config() -> dict:
@@ -1867,6 +1933,9 @@ def run_new_job(mode: str) -> bool:
     # Always use threading mode - ask for thread count
     num_threads = get_threading_choice()
 
+    # Ask for preferred transcript language(s)
+    get_language_preference()
+
     # Ask for output file configuration
     output_config = get_output_config()
 
@@ -1895,6 +1964,14 @@ def resume_job(progress: dict) -> bool:
     # Always use threading mode - ask for thread count
     num_threads = get_threading_choice()
 
+    # Restore or ask for preferred transcript language(s)
+    saved_langs = progress.get('transcript_languages')
+    if saved_langs:
+        set_transcript_languages(saved_langs)
+        print(f"Preferred transcript language(s): {', '.join(saved_langs)}")
+    else:
+        get_language_preference()
+
     # Retrieve output config from progress data or ask user
     output_config = progress.get('output_config')
     if output_config is None:
@@ -1912,6 +1989,14 @@ def resume_job(progress: dict) -> bool:
 
 
 def main():
+    # Force UTF-8 output so unicode symbols don't crash on cp1252 consoles
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+
     # Ensure subtitles folder exists for saving downloaded transcripts
     os.makedirs(PROGRESS_DIR, exist_ok=True)
 
