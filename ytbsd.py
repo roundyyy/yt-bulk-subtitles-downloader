@@ -103,7 +103,11 @@ def download_fresh_proxies(proxy_file: str = PROXY_FILE) -> int:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")  # Suppress Chrome logs
-        driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+        try:
+            # Prefer Selenium Manager so the driver matches the installed Chrome version.
+            driver = webdriver.Chrome(options=options)
+        except Exception:
+            driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
 
         url = "https://free-proxy-list.net/en/"
         driver.get(url)
@@ -150,6 +154,7 @@ THREAD_DELAY_MAX = 3.0
 # Proxy settings
 MAX_PROXY_RETRIES = 20  # Reduced to avoid long waits
 PROXY_TIMEOUT = 15  # Timeout for proxy validation
+MAX_PROXY_ATTEMPTS_PER_VIDEO = 6  # Avoid getting stuck on private/members-only videos
 
 # Video fetch timeout (seconds) - if a video takes longer, skip it
 VIDEO_FETCH_TIMEOUT = 15
@@ -306,6 +311,7 @@ class VideoWorkQueue:
 
         # Track which proxies have been tried for each video (per-video, not global)
         self.video_proxy_attempts = {v['id']: set() for v in videos}
+        self.video_attempt_counts = {v['id']: 0 for v in videos}
 
         # Track "no transcript" votes (need 2 confirmations)
         self.no_transcript_votes = {v['id']: 0 for v in videos}
@@ -343,16 +349,28 @@ class VideoWorkQueue:
         with self.lock:
             all_proxies = set(self.proxy_pool.proxies)  # All available proxies
 
+            for vid, state in list(self.video_states.items()):
+                if (state in ('pending', 'in_progress') and
+                        self.video_attempt_counts[vid] >= MAX_PROXY_ATTEMPTS_PER_VIDEO and
+                        self.active_workers[vid] == 0):
+                    self._mark_failed_locked(
+                        vid,
+                        f"Stopped after {MAX_PROXY_ATTEMPTS_PER_VIDEO} proxy attempts"
+                    )
+
             # Strategy 1: Find a pending video
             for video in self.video_list:
                 vid = video['id']
                 if self.video_states[vid] == 'pending':
+                    if self.video_attempt_counts[vid] >= MAX_PROXY_ATTEMPTS_PER_VIDEO:
+                        continue
                     # Get a random proxy not yet tried for this video
                     available = all_proxies - self.video_proxy_attempts[vid]
                     if available:
                         proxy = random.choice(list(available))
                         self.video_states[vid] = 'in_progress'
                         self.video_proxy_attempts[vid].add(proxy)
+                        self.video_attempt_counts[vid] += 1
                         self.active_workers[vid] += 1
                         self.total_proxy_attempts += 1
                         return (video, proxy)
@@ -362,6 +380,8 @@ class VideoWorkQueue:
             in_progress = []
             for vid, state in self.video_states.items():
                 if state == 'in_progress':
+                    if self.video_attempt_counts[vid] >= MAX_PROXY_ATTEMPTS_PER_VIDEO:
+                        continue
                     available_count = len(all_proxies - self.video_proxy_attempts[vid])
                     if available_count > 0:
                         in_progress.append((vid, self.active_workers[vid], available_count))
@@ -374,6 +394,7 @@ class VideoWorkQueue:
                 if available:
                     proxy = random.choice(list(available))
                     self.video_proxy_attempts[vid].add(proxy)
+                    self.video_attempt_counts[vid] += 1
                     self.active_workers[vid] += 1
                     self.total_proxy_attempts += 1
                     return (self.videos[vid], proxy)
@@ -390,12 +411,21 @@ class VideoWorkQueue:
             # Check if ANY video still has untried proxies
             any_available = False
             for vid in pending_or_in_progress:
-                if len(all_proxies - self.video_proxy_attempts[vid]) > 0:
+                if (self.video_attempt_counts[vid] < MAX_PROXY_ATTEMPTS_PER_VIDEO and
+                        len(all_proxies - self.video_proxy_attempts[vid]) > 0):
                     any_available = True
                     break
 
+            any_active = any(self.active_workers[vid] > 0 for vid in pending_or_in_progress)
+
             if any_available:
                 # Shouldn't reach here, but retry just in case
+                should_retry = True
+            elif any_active:
+                # In-flight workers may finish and finalize capped videos.
+                self.lock.release()
+                time.sleep(0.5)
+                self.lock.acquire()
                 should_retry = True
             elif self.refresh_in_progress:
                 # Another thread is refreshing, wait and retry
@@ -412,9 +442,10 @@ class VideoWorkQueue:
                     # Max refreshes reached - mark remaining as failed
                     for vid in pending_or_in_progress:
                         if self.video_states[vid] not in ('completed', 'no_transcript'):
-                            self.video_states[vid] = 'failed'
-                            self.failed_count += 1
-                            self.completed_count += 1
+                            self._mark_failed_locked(
+                                vid,
+                                f"Failed after {self.proxy_refresh_count} proxy refresh cycles"
+                            )
                     return None
 
         # Retry after refresh (outside lock)
@@ -464,6 +495,23 @@ class VideoWorkQueue:
             return True
 
         return False
+
+    def _mark_failed_locked(self, video_id: str, error_detail: str):
+        """Mark a video as failed. Must be called with lock held."""
+        if self.video_states[video_id] in ('completed', 'no_transcript', 'failed'):
+            return
+
+        self.video_states[video_id] = 'failed'
+        self.results[video_id] = {
+            'id': video_id,
+            'title': self.videos[video_id]['title'],
+            'transcript': None,
+            'language': None,
+            'method': 'failed',
+            'error_detail': error_detail
+        }
+        self.failed_count += 1
+        self.completed_count += 1
 
     def mark_completed(self, video_id: str, result: dict):
         """Mark video as successfully completed."""
@@ -557,7 +605,7 @@ def sanitize_filename(name: str) -> str:
 def extract_video_id(url: str) -> str:
     """Extract video ID from various YouTube URL formats."""
     patterns = [
-        r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})',
+        r'(?:v=|/v/|/live/|youtu\.be/)([a-zA-Z0-9_-]{11})',
         r'^([a-zA-Z0-9_-]{11})$'
     ]
     for pattern in patterns:
@@ -1312,12 +1360,22 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     # Initialize proxy pool
     proxy_pool = ProxyPool(PROXY_FILE, validate=False)
 
+    if not proxy_pool.has_proxies():
+        return download_transcripts_direct_parallel(
+            videos, source_name, source_type, num_threads,
+            existing_data=videos_data,
+            completed_ids=completed_ids,
+            output_config=output_config
+        )
+
     # NOTE: We no longer cap threads to remaining videos!
     # Multiple threads can now collaborate on the same video with different proxies
     print(f"\nDownloading transcripts for {total} video(s) [Collaborative Multi-Proxy Mode]")
     print(f"Already completed: {len(completed_ids)}, Remaining: {len(remaining_videos)}")
     print(f"Using {num_threads} threads (can collaborate on same video)")
     print(f"Loaded {len(proxy_pool.proxies)} proxies, auto-refresh enabled (up to 3x)")
+    print(f"Max proxy attempts per video: {MAX_PROXY_ATTEMPTS_PER_VIDEO}")
+    print("Press Ctrl+C to finish with current results.")
     print("-" * 60)
 
     # Initialize thread status manager
@@ -1485,6 +1543,123 @@ def download_transcripts_parallel(videos: list[dict], source_name: str, source_t
     return videos_data, final_success, was_interrupted
 
 
+def download_transcripts_direct_parallel(videos: list[dict], source_name: str, source_type: str,
+                                         num_threads: int = DEFAULT_THREADS,
+                                         existing_data: list[dict] = None,
+                                         completed_ids: set = None, output_config: dict = None):
+    """
+    Download transcripts directly when no proxies are available.
+    This avoids marking every video failed just because proxy scraping failed.
+    """
+    videos_data = existing_data if existing_data else []
+    completed_ids = completed_ids if completed_ids else set(v['id'] for v in videos_data)
+    total = len(videos)
+    remaining_videos = [v for v in videos if v['id'] not in completed_ids]
+    was_interrupted = False
+
+    if not remaining_videos:
+        print("All videos already processed!")
+        return videos_data, sum(1 for v in videos_data if v.get('transcript')), False
+
+    direct_threads = max(MIN_THREADS, min(num_threads, len(remaining_videos)))
+
+    print(f"\nDownloading transcripts for {total} video(s) [Direct Mode - No Proxies]")
+    print(f"Already completed: {len(completed_ids)}, Remaining: {len(remaining_videos)}")
+    print(f"Using {direct_threads} thread(s)")
+    print("No proxies loaded; trying direct transcript requests.")
+    print("Press Ctrl+C to finish with current results.")
+    print("-" * 60)
+
+    status_manager = ThreadStatusManager(direct_threads, total)
+
+    already_success = sum(1 for v in videos_data if v.get('transcript'))
+    already_no_transcript = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
+    already_failed = len(videos_data) - already_success - already_no_transcript
+    status_manager.update_progress(len(completed_ids), already_success, already_failed, already_no_transcript)
+
+    results_lock = threading.Lock()
+    worker_to_slot = {}
+    next_slot_id = [0]
+
+    def direct_worker(video: dict) -> dict:
+        worker_name = threading.current_thread().name
+        with results_lock:
+            if worker_name not in worker_to_slot:
+                worker_to_slot[worker_name] = next_slot_id[0]
+                next_slot_id[0] += 1
+            thread_slot = worker_to_slot[worker_name]
+
+        title_short = video['title'][:35] + "..." if len(video['title']) > 35 else video['title']
+
+        def update_status(msg):
+            status_manager.update_status(thread_slot, f"{title_short[:25]}... | {msg}")
+
+        update_status("Trying direct...")
+        result = download_single_video_with_proxy(video, None, status_callback=update_status)
+
+        with results_lock:
+            videos_data.append(result)
+            completed_ids.add(result['id'])
+
+            success_count = sum(1 for v in videos_data if v.get('transcript'))
+            no_transcript_count = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
+            failed_count = len(videos_data) - success_count - no_transcript_count
+            status_manager.update_progress(len(completed_ids), success_count, failed_count, no_transcript_count)
+
+            if result.get('transcript'):
+                status_manager.update_status(thread_slot, f"✓ OK ({result['language']}) via direct")
+            elif result.get('method') == 'no_transcript':
+                status_manager.update_status(thread_slot, "✗ No transcript")
+            else:
+                status_manager.update_status(thread_slot, "✗ Direct failed")
+
+        return result
+
+    errors = []
+    try:
+        with status_manager.get_live_context():
+            with ThreadPoolExecutor(max_workers=direct_threads) as executor:
+                futures = [executor.submit(direct_worker, video) for video in remaining_videos]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        errors.append(f"Worker error: {e}")
+
+    except KeyboardInterrupt:
+        status_manager.stop_display()
+        print("\n\n** Download interrupted by user **")
+        was_interrupted = True
+
+    status_manager.stop_display()
+
+    final_success = sum(1 for v in videos_data if v.get('transcript'))
+    final_no_transcript = sum(1 for v in videos_data if v.get('method') == 'no_transcript')
+    final_failed = len(videos_data) - final_success - final_no_transcript
+
+    for error_msg in errors:
+        print(error_msg)
+
+    progress_data = {
+        'source_name': source_name,
+        'source_type': source_type,
+        'videos': videos,
+        'current_index': len(completed_ids),
+        'videos_data': videos_data,
+        'completed_ids': list(completed_ids),
+        'started_at': datetime.now().isoformat(),
+        'completed': not was_interrupted,
+        'mode': 'parallel_direct',
+        'output_config': output_config
+    }
+    save_progress(progress_data)
+
+    print("\n" + "-" * 60)
+    print(f"Results: {final_success} success, {final_no_transcript} no transcript, {final_failed} failed")
+
+    return videos_data, final_success, was_interrupted
+
+
 # ============================================================================
 # CLI Interface
 # ============================================================================
@@ -1601,23 +1776,43 @@ def get_url(mode: str) -> str:
 
 def get_channel_content_type() -> str:
     """Ask user what type of content to download from channel."""
+    content_options = {
+        1: ("videos", "Videos only"),
+        2: ("shorts", "Shorts only"),
+        3: ("streams", "Live streams only"),
+        4: ("videos_shorts", "Videos and shorts"),
+        5: ("videos_streams", "Videos and live streams"),
+        6: ("shorts_streams", "Shorts and live streams"),
+        7: ("all", "Videos, shorts, and live streams"),
+    }
+
     print("\nWhat content would you like to download?\n")
-    print("  [1] Videos only")
-    print("  [2] Shorts only")
-    print("  [3] Both videos and shorts\n")
+    for number, (_, label) in content_options.items():
+        print(f"  [{number}] {label}")
+    print()
 
     while True:
         try:
-            choice = int(input("Enter your choice (1-3): "))
-            if choice == 1:
-                return "videos"
-            elif choice == 2:
-                return "shorts"
-            elif choice == 3:
-                return "both"
-            print("Invalid choice. Please enter 1, 2, or 3.")
+            choice = int(input("Enter your choice (1-7): "))
+            if choice in content_options:
+                return content_options[choice][0]
+            print("Invalid choice. Please enter a number from 1 to 7.")
         except ValueError:
             print("Invalid input. Please enter a number.")
+
+
+def get_channel_tabs_for_content_type(content_type: str) -> list[str]:
+    """Return YouTube channel tab suffixes for a selected content type."""
+    content_tabs = {
+        "videos": ["videos"],
+        "shorts": ["shorts"],
+        "streams": ["streams"],
+        "videos_shorts": ["videos", "shorts"],
+        "videos_streams": ["videos", "streams"],
+        "shorts_streams": ["shorts", "streams"],
+        "all": ["videos", "shorts", "streams"],
+    }
+    return content_tabs[content_type]
 
 
 def get_output_config() -> dict:
@@ -1799,46 +1994,38 @@ def run_new_job(mode: str) -> bool:
         content_type = get_channel_content_type()
 
         videos = []
+        seen_video_ids = set()
         source_name = ""
         source_type = "channel"
+        channel_tabs = get_channel_tabs_for_content_type(content_type)
 
-        if content_type == "videos":
-            print(f"\nFetching videos from channel...")
+        for tab in channel_tabs:
+            print(f"\nFetching {tab} from channel...")
             try:
-                videos, source_name, source_type = get_video_ids_from_url(url + "/videos", mode, proxy_pool)
-            except Exception as e:
-                print(f"Error fetching video information: {e}")
-                return True
+                tab_videos, tab_source_name, tab_source_type = get_video_ids_from_url(url + f"/{tab}", mode, proxy_pool)
+                added_count = 0
+                for video in tab_videos:
+                    video_id = video.get('id')
+                    if not video_id or video_id in seen_video_ids:
+                        continue
+                    videos.append(video)
+                    seen_video_ids.add(video_id)
+                    added_count += 1
 
-        elif content_type == "shorts":
-            print(f"\nFetching shorts from channel...")
-            try:
-                videos, source_name, source_type = get_video_ids_from_url(url + "/shorts", mode, proxy_pool)
+                if tab_source_name and not source_name:
+                    source_name = tab_source_name
+                source_type = tab_source_type
+                print(f"Found {added_count} {tab.replace('_', ' ')} item(s)")
             except Exception as e:
-                print(f"Error fetching shorts information: {e}")
-                return True
+                if len(channel_tabs) == 1:
+                    print(f"Error fetching {tab} information: {e}")
+                    return True
+                print(f"Warning: Could not fetch {tab}: {e}")
 
-        else:  # both
-            print(f"\nFetching videos from channel...")
-            try:
-                videos_list, source_name, source_type = get_video_ids_from_url(url + "/videos", mode, proxy_pool)
-                videos.extend(videos_list)
-                print(f"Found {len(videos_list)} video(s)")
-            except Exception as e:
-                print(f"Warning: Could not fetch videos: {e}")
-
-            print(f"\nFetching shorts from channel...")
-            try:
-                shorts_list, _, _ = get_video_ids_from_url(url + "/shorts", mode, proxy_pool)
-                videos.extend(shorts_list)
-                print(f"Found {len(shorts_list)} short(s)")
-            except Exception as e:
-                print(f"Warning: Could not fetch shorts: {e}")
-
-            if not source_name:
-                # Try to extract channel name from URL if we couldn't get it
-                match = re.search(r'@([^/]+)', url)
-                source_name = match.group(1) if match else "channel"
+        if not source_name:
+            # Try to extract channel name from URL if we couldn't get it
+            match = re.search(r'@([^/]+)', url)
+            source_name = match.group(1) if match else "channel"
 
         if not videos:
             print("No videos found.")
