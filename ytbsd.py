@@ -154,7 +154,7 @@ THREAD_DELAY_MAX = 3.0
 # Proxy settings
 MAX_PROXY_RETRIES = 20  # Reduced to avoid long waits
 PROXY_TIMEOUT = 15  # Timeout for proxy validation
-MAX_PROXY_ATTEMPTS_PER_VIDEO = 6  # Avoid getting stuck on private/members-only videos
+MAX_PROXY_ATTEMPTS_PER_VIDEO = 100  # Avoid getting stuck on private/members-only videos (Increased if proxy fails)
 
 # Video fetch timeout (seconds) - if a video takes longer, skip it
 VIDEO_FETCH_TIMEOUT = 15
