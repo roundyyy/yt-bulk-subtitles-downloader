@@ -889,6 +889,10 @@ def create_markdown_output(videos_data: list[dict], source_name: str, source_typ
         lines.append("")
         lines.append(f"**Video ID:** {video['id']}")
         lines.append(f"**URL:** https://www.youtube.com/watch?v={video['id']}")
+        if video.get('publish_date'):
+            lines.append(f"**Published:** {video['publish_date']}")
+        if video.get('view_count') is not None:
+            lines.append(f"**Views:** {video['view_count']:,}")
         if video.get('language'):
             lines.append(f"**Transcript Language:** {video['language']}")
         lines.append("")
@@ -1146,6 +1150,68 @@ def check_availability_with_timeout(video_id: str, proxy: str = None, timeout: i
         raise
 
 
+# ============================================================================
+# Video Metadata (publish date, view count)
+# ============================================================================
+
+# Clients for YouTube's inner player API, used to fetch publish date and view
+# count. The web client serves metadata even for restricted videos; the VR
+# client is the fallback for cases where the web client demands a login.
+# Version strings rotate over time - taken from yt-dlp's innertube client
+# table (September 2026); refresh them if metadata lookups start failing.
+INNERTUBE_CLIENTS = [
+    {'clientName': 'WEB', 'clientVersion': '2.20260708.00.00'},
+    {'clientName': 'ANDROID_VR', 'clientVersion': '1.65.10',
+     'deviceMake': 'Oculus', 'deviceModel': 'Quest 3',
+     'osName': 'Android', 'osVersion': '12L'},
+]
+
+METADATA_TIMEOUT = 10  # Seconds per metadata request
+
+
+def fetch_video_metadata(video_id: str, proxy: str = None) -> dict:
+    """
+    Fetch publish date and view count for a video from YouTube's inner API.
+    Returns {'publish_date': 'YYYY-MM-DD' or None, 'view_count': int or None}.
+    Best effort: on failure both values are None and the transcript download
+    is unaffected.
+    """
+    import requests
+
+    proxies = None
+    if proxy:
+        proxy_url = f"http://{proxy}"
+        proxies = {'http': proxy_url, 'https': proxy_url}
+
+    for client in INNERTUBE_CLIENTS:
+        try:
+            response = requests.post(
+                'https://www.youtube.com/youtubei/v1/player',
+                json={'context': {'client': dict(client)}, 'videoId': video_id},
+                headers={
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                },
+                proxies=proxies,
+                timeout=METADATA_TIMEOUT,
+            )
+            data = response.json()
+
+            microformat = data.get('microformat', {}).get('playerMicroformatRenderer', {})
+            details = data.get('videoDetails', {})
+
+            publish_date = microformat.get('publishDate') or microformat.get('uploadDate')
+            view_count = details.get('viewCount') or microformat.get('viewCount')
+
+            if publish_date or view_count:
+                return {
+                    'publish_date': publish_date[:10] if publish_date else None,
+                    'view_count': int(view_count) if view_count else None,
+                }
+        except Exception:
+            continue
+
+    return {'publish_date': None, 'view_count': None}
 
 
 def download_single_video_with_proxy(video: dict, proxy: str, status_callback=None) -> dict:
@@ -1164,7 +1230,9 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
         'transcript': None,
         'language': None,
         'method': None,
-        'error_detail': None
+        'error_detail': None,
+        'publish_date': None,
+        'view_count': None
     }
 
     proxy_ip = proxy.split(':')[0] if proxy else "Direct"
@@ -1186,6 +1254,9 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
         except NoTranscriptError:
             # Definitive - no transcript exists
             result_data['method'] = "no_transcript"
+            # Best-effort metadata so entries without transcripts still carry
+            # their publish date and view count
+            result_data.update(fetch_video_metadata(video_id, proxy=proxy))
             if status_callback:
                 status_callback("No transcript available")
             return result_data
@@ -1203,6 +1274,7 @@ def download_single_video_with_proxy(video: dict, proxy: str, status_callback=No
             result_data['fetched_transcript'] = fetched_transcript  # Raw data for SRT
             result_data['language'] = lang_info
             result_data['method'] = strategy_name.lower()
+            result_data.update(fetch_video_metadata(video_id, proxy=proxy))
             return result_data
 
         except Exception as e:
