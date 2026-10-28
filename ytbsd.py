@@ -35,6 +35,7 @@ try:
         TranscriptsDisabled,
         CouldNotRetrieveTranscript,
     )
+    from youtube_transcript_api import FetchedTranscriptSnippet
     from youtube_transcript_api.proxies import GenericProxyConfig
     from youtube_transcript_api.formatters import SRTFormatter
 except ImportError:
@@ -42,14 +43,9 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.chrome.service import Service as ChromeService
-    from webdriver_manager.chrome import ChromeDriverManager
+    import requests
 except ImportError:
-    print("Error: selenium or webdriver-manager is not installed. Install with: pip install selenium webdriver-manager")
+    print("Error: requests is not installed. Install it with: pip install requests")
     sys.exit(1)
 
 try:
@@ -88,44 +84,38 @@ PROXY_FILE = os.path.join(SCRIPT_DIR, "proxies.txt")
 # Proxy Scraping
 # ============================================================================
 
+PROXY_LIST_URL = "https://free-proxy-list.net/en/"
+PROXY_LIST_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/130.0 Safari/537.36',
+}
+
+
 def download_fresh_proxies(proxy_file: str = PROXY_FILE) -> int:
     """
     Download fresh proxy list from free-proxy-list.net and save to file.
     Returns the number of proxies downloaded.
+
+    The "Get raw list" textarea is part of the static page HTML, so a plain
+    HTTP request is enough - no browser needed.
     """
     print("\nDownloading fresh proxy list...")
 
-    driver = None
     try:
-        options = webdriver.ChromeOptions()
-        options.add_argument("--headless")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--log-level=3")  # Suppress Chrome logs
-        try:
-            # Prefer Selenium Manager so the driver matches the installed Chrome version.
-            driver = webdriver.Chrome(options=options)
-        except Exception:
-            driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options)
+        response = requests.get(PROXY_LIST_URL, headers=PROXY_LIST_HEADERS, timeout=20)
+        response.raise_for_status()
 
-        url = "https://free-proxy-list.net/en/"
-        driver.get(url)
+        # Prefer the raw-list textarea; fall back to the whole page
+        match = re.search(r'<textarea[^>]*>(.*?)</textarea>', response.text, re.DOTALL)
+        content = match.group(1) if match else response.text
 
-        wait = WebDriverWait(driver, 10)
-        button_selector = 'a[title="Get raw list"]'
-        button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, button_selector)))
-        button.click()
-
-        textarea_selector = 'textarea.form-control'
-        textarea = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, textarea_selector)))
-
-        content = textarea.get_attribute("value")
-        proxies = re.findall(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+', content)
-        clean_content = "\n".join(proxies)
+        # dict.fromkeys de-duplicates while keeping order
+        proxies = list(dict.fromkeys(re.findall(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+', content)))
+        if not proxies:
+            raise ValueError("no proxies found on the page")
 
         with open(proxy_file, "w", encoding="utf-8") as f:
-            f.write(clean_content)
+            f.write("\n".join(proxies))
 
         proxy_count = len(proxies)
         print(f"✓ Downloaded {proxy_count} proxies\n")
@@ -135,9 +125,6 @@ def download_fresh_proxies(proxy_file: str = PROXY_FILE) -> int:
     except Exception as e:
         print(f"⚠ Failed to download proxies: {e}\n")
         return 0
-    finally:
-        if driver:
-            driver.quit()
 
 
 # ============================================================================
@@ -344,6 +331,17 @@ class VideoWorkQueue:
         NOTE: We do NOT globally blacklist proxies. A proxy that fails on video A
         might work on video B. We only track which proxies have been tried per-video.
         """
+        # Loop instead of recursing, so long waits can't hit the recursion limit
+        while True:
+            work = self._try_get_work()
+            if work != 'retry':
+                return work
+            # Check if all work was completed while we were waiting
+            if self.is_all_work_done():
+                return None
+
+    def _try_get_work(self):
+        """One attempt of get_work(). Returns work tuple, None, or 'retry'."""
         should_retry = False
 
         with self.lock:
@@ -450,10 +448,7 @@ class VideoWorkQueue:
 
         # Retry after refresh (outside lock)
         if should_retry:
-            # Check if all work was completed while we were waiting
-            if self.is_all_work_done():
-                return None
-            return self.get_work()
+            return 'retry'
 
         return None
 
@@ -845,12 +840,19 @@ def save_progress(progress_data: dict):
         os.makedirs(PROGRESS_DIR, exist_ok=True)
         # Create a copy to avoid modifying original data
         data_to_save = dict(progress_data)
-        # Strip non-serializable fields from videos_data (e.g., FetchedTranscript objects)
+        # Replace non-serializable FetchedTranscript objects with their raw
+        # snippets, so SRT output still works for videos after a resume
         if 'videos_data' in data_to_save:
-            data_to_save['videos_data'] = [
-                {k: v for k, v in video.items() if k != 'fetched_transcript'}
-                for video in data_to_save['videos_data']
-            ]
+            serializable = []
+            for video in data_to_save['videos_data']:
+                item = {k: v for k, v in video.items() if k != 'fetched_transcript'}
+                if video.get('fetched_transcript') is not None:
+                    item['snippets'] = [
+                        {'text': s.text, 'start': s.start, 'duration': s.duration}
+                        for s in video['fetched_transcript']
+                    ]
+                serializable.append(item)
+            data_to_save['videos_data'] = serializable
         with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
             json.dump(data_to_save, f, indent=2, ensure_ascii=False)
 
@@ -985,6 +987,7 @@ def create_srt_output(videos_data: list[dict], source_name: str, output_dir: str
     """
     formatter = SRTFormatter()
     filepaths = []
+    used_names = set()
 
     # Create folder with source name
     folder_name = sanitize_filename(source_name)
@@ -992,18 +995,27 @@ def create_srt_output(videos_data: list[dict], source_name: str, output_dir: str
     os.makedirs(srt_dir, exist_ok=True)
 
     for video in videos_data:
+        # Raw timestamped data: live object, or snippets restored from progress file
+        transcript_data = video.get('fetched_transcript')
+        if not transcript_data and video.get('snippets'):
+            transcript_data = [FetchedTranscriptSnippet(**s) for s in video['snippets']]
+
         # Skip videos without transcripts or without raw data
-        if not video.get('fetched_transcript'):
+        if not transcript_data:
             continue
 
-        # Create filename from video title
-        video_title = sanitize_filename(video['title'])
+        # Create filename from video title (add video ID if title already used,
+        # so videos with identical titles don't overwrite each other)
+        video_title = sanitize_filename(video['title']) or video['id']
+        if video_title.lower() in used_names:
+            video_title = f"{video_title} [{video['id']}]"
+        used_names.add(video_title.lower())
         filename = f"{video_title}.srt"
         filepath = os.path.join(srt_dir, filename)
 
         # Format transcript as SRT
         try:
-            srt_content = formatter.format_transcript(video['fetched_transcript'])
+            srt_content = formatter.format_transcript(transcript_data)
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(srt_content)
             filepaths.append(filepath)
@@ -2296,4 +2308,24 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    exit_code = 0
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nGoodbye!")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        exit_code = 1
+        # A double-clicked exe closes its console window on exit - keep it
+        # open so the error can be read
+        if getattr(sys, 'frozen', False):
+            try:
+                input("\nPress Enter to exit...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Exit without joining timed-out worker threads that may still be stuck
+    # on a dead proxy (they would otherwise keep the process alive)
+    os._exit(exit_code)

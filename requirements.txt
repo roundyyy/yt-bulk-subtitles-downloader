@@ -1,6 +1,4 @@
 youtube-transcript-api
 yt-dlp
 requests
-selenium
-webdriver-manager
 rich
